@@ -1,0 +1,374 @@
+// ReEat v1 — PostgreSQL schema (spec §9).
+// Conventions: UUID ids, created_at/updated_at in UTC, money as integer baisa
+// (1 OMR = 1,000 baisa), soft-delete (deleted_at) for partners/listings/users only —
+// never for orders, payments or audit logs. No demo data is seeded (see seed.ts).
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum UserRole {
+  customer
+  partner_owner
+  partner_staff
+  admin
+}
+
+enum UserStatus {
+  active
+  disabled
+}
+
+model User {
+  id               String    @id @default(uuid())
+  role             UserRole
+  email            String?   @unique
+  mobile           String?   @unique
+  fullName         String?
+  passwordHash     String? // admin / partner accounts only; customers use OTP
+  status           UserStatus @default(active)
+  termsAcceptedAt  DateTime?
+  createdAt        DateTime  @default(now())
+  updatedAt        DateTime  @updatedAt
+  deletedAt        DateTime?
+
+  ownedPartners    Partner[]        @relation("PartnerOwner")
+  staffOf          PartnerStaff[]
+  orders           Order[]          @relation("CustomerOrders")
+  reviews          Review[]
+  favourites       Favourite[]
+  verifiedOrders   Order[]          @relation("VerifiedBy")
+  auditEntries     AuditLog[]       @relation("AuditActor")
+  otpCodes         OtpCode[]
+  notifications    Notification[]
+}
+
+model OtpCode {
+  id         String   @id @default(uuid())
+  userId     String
+  user       User     @relation(fields: [userId], references: [id])
+  codeHash   String
+  purpose    String // signin | admin_2fa
+  expiresAt  DateTime
+  usedAt     DateTime?
+  createdAt  DateTime @default(now())
+
+  @@index([userId, purpose])
+}
+
+enum PartnerStatus {
+  applied
+  under_review
+  more_info_needed
+  verified
+  live
+  suspended
+  verification_expired
+  rejected
+  closed
+}
+
+model Partner {
+  id                String        @id @default(uuid())
+  businessName      String
+  displayName       String
+  area              String
+  address           String
+  latitude          Float?
+  longitude         Float?
+  ownerUserId       String
+  owner             User          @relation("PartnerOwner", fields: [ownerUserId], references: [id])
+  status            PartnerStatus @default(applied)
+  commissionPercent Int           @default(20)
+  bankName          String?
+  accountName       String?
+  iban              String? // encrypted at rest in production (see README)
+  logoUrl           String?
+  coverUrl          String?
+  description       String?
+  contactEmail      String?
+  contactPhone      String?
+  openingHours      String?
+  pickupInstructions String?
+  createdAt         DateTime      @default(now())
+  updatedAt         DateTime      @updatedAt
+  deletedAt         DateTime?
+
+  documents         PartnerDocument[]
+  listings          Listing[]
+  orders            Order[]
+  payouts           Payout[]
+  staff             PartnerStaff[]
+  reviews           Review[]
+  favourites        Favourite[]
+  bankChangeRequests BankChangeRequest[]
+}
+
+model PartnerStaff {
+  id         String  @id @default(uuid())
+  partnerId  String
+  partner    Partner @relation(fields: [partnerId], references: [id])
+  userId     String
+  user       User    @relation(fields: [userId], references: [id])
+  canCreateListings Boolean @default(true)
+  createdAt  DateTime @default(now())
+
+  @@unique([partnerId, userId])
+}
+
+enum DocumentType {
+  municipality_licence
+  food_safety_approval
+  commercial_registration
+  other
+}
+
+enum DocumentReviewStatus {
+  pending
+  approved
+  rejected
+}
+
+model PartnerDocument {
+  id           String               @id @default(uuid())
+  partnerId    String
+  partner      Partner              @relation(fields: [partnerId], references: [id])
+  documentType DocumentType
+  fileUrl      String // private bucket reference — never a public URL
+  expiryDate   DateTime?
+  reviewStatus DocumentReviewStatus @default(pending)
+  reviewedById String?
+  reviewNote   String?
+  createdAt    DateTime             @default(now())
+  updatedAt    DateTime             @updatedAt
+}
+
+model BankChangeRequest {
+  id          String   @id @default(uuid())
+  partnerId   String
+  partner     Partner  @relation(fields: [partnerId], references: [id])
+  bankName    String
+  accountName String
+  iban        String
+  status      String   @default("pending") // pending | approved | rejected
+  reviewedById String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+}
+
+enum ListingCategory {
+  bakery
+  cafe
+  restaurant
+  sweets
+  other
+}
+
+enum ListingStatus {
+  draft
+  live
+  sold_out
+  expired
+  removed
+  ended_early
+}
+
+model Listing {
+  id                   String        @id @default(uuid())
+  partnerId            String
+  partner              Partner       @relation(fields: [partnerId], references: [id])
+  title                String
+  description          String
+  category             ListingCategory
+  photoUrl             String?
+  allergenNote         String?
+  originalPriceBaisa   Int
+  reeatPriceBaisa      Int
+  quantityTotal        Int
+  quantityRemaining    Int
+  listingDate          DateTime // must equal today in Asia/Muscat at publish time
+  pickupStart          DateTime
+  pickupEnd            DateTime
+  status               ListingStatus @default(draft)
+  removedReason        String?
+  createdAt            DateTime      @default(now())
+  updatedAt            DateTime      @updatedAt
+  deletedAt            DateTime?
+
+  orders               Order[]
+}
+
+enum OrderStatus {
+  payment_pending
+  payment_failed
+  paid
+  collected
+  not_collected
+  cancelled_refunded
+}
+
+model Order {
+  id                 String      @id @default(uuid())
+  customerId         String
+  customer           User        @relation("CustomerOrders", fields: [customerId], references: [id])
+  partnerId          String
+  partner            Partner     @relation(fields: [partnerId], references: [id])
+  listingId          String
+  listing            Listing     @relation(fields: [listingId], references: [id])
+  itemName           String // denormalised at purchase time
+  quantity           Int
+  unitPriceBaisa     Int
+  totalBaisa         Int
+  commissionBaisa    Int
+  partnerShareBaisa  Int
+  pickupCode         String      @unique
+  pickupCodeHash     String      @unique
+  status             OrderStatus @default(payment_pending)
+  paidAt             DateTime?
+  collectedAt        DateTime?
+  verifiedById       String?
+  verifiedBy         User?       @relation("VerifiedBy", fields: [verifiedById], references: [id])
+  refundReason       String?
+  createdAt          DateTime    @default(now())
+  updatedAt          DateTime    @updatedAt
+
+  payments           Payment[]
+  review             Review?
+  payoutItems        PayoutItem[]
+}
+
+enum PaymentStatus {
+  pending
+  succeeded
+  failed
+  refunded
+  partially_refunded
+}
+
+model Payment {
+  id               String        @id @default(uuid())
+  orderId          String
+  order            Order         @relation(fields: [orderId], references: [id])
+  gateway          String        @default("thawani") // thawani | apple_pay | card
+  gatewayReference String?       @unique
+  amountBaisa      Int
+  currency         String        @default("OMR")
+  status           PaymentStatus @default(pending)
+  rawWebhookLog    Json?
+  createdAt        DateTime      @default(now())
+  updatedAt        DateTime      @updatedAt
+}
+
+enum PayoutStatus {
+  accruing
+  ready
+  approved
+  paid
+  disputed
+}
+
+model Payout {
+  id                String       @id @default(uuid())
+  partnerId         String
+  partner           Partner      @relation(fields: [partnerId], references: [id])
+  periodStart       DateTime
+  periodEnd         DateTime
+  grossBaisa        Int
+  commissionBaisa   Int
+  partnerShareBaisa Int
+  status            PayoutStatus @default(accruing)
+  bankReference     String?
+  paidAt            DateTime?
+  disputeNote       String?
+  createdAt         DateTime     @default(now())
+  updatedAt         DateTime     @updatedAt
+
+  items             PayoutItem[]
+}
+
+model PayoutItem {
+  id         String @id @default(uuid())
+  payoutId   String
+  payout     Payout @relation(fields: [payoutId], references: [id])
+  orderId    String @unique // an order appears in exactly one payout
+  order      Order  @relation(fields: [orderId], references: [id])
+  amountBaisa Int // partner share for this order
+
+  @@index([payoutId])
+}
+
+model Review {
+  id               String   @id @default(uuid())
+  orderId          String   @unique // one review per order
+  order            Order    @relation(fields: [orderId], references: [id])
+  customerId       String
+  customer         User     @relation(fields: [customerId], references: [id])
+  partnerId        String
+  partner          Partner  @relation(fields: [partnerId], references: [id])
+  rating           Int
+  comment          String?
+  moderationStatus String   @default("published") // published | hidden
+  moderationReason String?
+  createdAt        DateTime @default(now())
+}
+
+model Favourite {
+  customerId String
+  customer   User    @relation(fields: [customerId], references: [id])
+  partnerId  String
+  partner    Partner @relation(fields: [partnerId], references: [id])
+  createdAt  DateTime @default(now())
+
+  @@id([customerId, partnerId])
+}
+
+model Notification {
+  id        String   @id @default(uuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id])
+  channel   String // email | in_app
+  template  String
+  payload   Json?
+  sentAt    DateTime?
+  status    String   @default("queued")
+  createdAt DateTime @default(now())
+}
+
+model AuditLog {
+  id           String   @id @default(uuid())
+  actorUserId  String?
+  actor        User?    @relation("AuditActor", fields: [actorUserId], references: [id])
+  actorLabel   String // e.g. "Admin" — never a personal name in v1
+  action       String
+  entity       String
+  entityId     String
+  before       Json?
+  after        Json?
+  createdAt    DateTime @default(now()) // append-only: no update/delete
+
+  @@index([entity, entityId])
+}
+
+model Setting {
+  key       String   @id
+  value     String
+  updatedBy String?
+  updatedAt DateTime @updatedAt
+}
+
+model PaymentGate {
+  id          String   @id @default(uuid())
+  gate        String   @unique // thawani_merchant | company_licence | staging_tests | partner_agreement
+  label       String
+  passed      Boolean  @default(false)
+  passedById  String?
+  passedAt    DateTime?
+  note        String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+}

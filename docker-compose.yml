@@ -1,0 +1,13 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: reeat
+      POSTGRES_PASSWORD: reeat
+      POSTGRES_DB: reeat
+    ports:
+      - "5432:5432"
+    volumes:
+      - reeat-pgdata:/var/lib/postgresql/data
+volumes:
+  reeat-pgdata:
